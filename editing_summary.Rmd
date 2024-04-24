@@ -1,0 +1,286 @@
+---
+title: "Amplicon Editing Summary"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 6
+    toc_float: yes
+    code_folding: hide
+params:
+    id: NULL
+    alignments_csv: NULL
+    read_chunk_size: 50000
+    min_report_freq: 0.001
+---
+
+```{r load_libraries, echo=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(stringdist)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=FALSE)
+```
+
+```{r load_data_from_params}
+id <- as.character(params$id)
+alignments_csv <- as.character(params$alignments_csv)
+
+csv_schema <- cols(
+  readname = col_character(),
+  wt_vs_read.score = col_double(),
+  donor_vs_read.score = col_double(),
+  wt_vs_read.align_wt = col_character(),
+  wt_vs_read.align_read = col_character(),
+  donor_vs_read.align_donor = col_character(),
+  donor_vs_read.align_read = col_character()
+)
+
+read_fractions_chunk <- function(data, position) {
+  data %>%
+      mutate(seq=gsub('-','',wt_vs_read.align_read)) %>%
+      count(wt_vs_read.score, donor_vs_read.score, seq, !!!alignment_cols_expr, name='read_count')
+}
+
+alignment_cols_expr <- quos(wt_vs_read.align_wt, wt_vs_read.align_read, donor_vs_read.align_donor, donor_vs_read.align_read)
+
+alignment_fractions <- readr::read_csv_chunked(alignments_csv, DataFrameCallback$new(read_fractions_chunk), col_types=csv_schema,chunk_size=params$read_chunk_size) %>%
+    count(wt_vs_read.score, donor_vs_read.score, seq, !!!alignment_cols_expr, wt=read_count, name='read_count') %>%
+    mutate(read_fraction = read_count / sum(read_count)) %>%
+    arrange(desc(donor_vs_read.score) )
+
+most_similar_to_insert <- alignment_fractions %>%
+  filter( wt_vs_read.score < donor_vs_read.score )
+
+most_abundant_sequences <- alignment_fractions %>%
+  filter( read_fraction > params$min_report_freq) %>%
+  relocate(read_fraction) %>%
+  arrange(desc(read_fraction))
+
+# Alignments of the 50 most abundant alleles
+
+knitr::kable(most_abundant_sequences)
+
+read_frequencies_chunk <- function(data, position) {
+  data %>%
+      mutate(read_is_wt = wt_vs_read.align_read == wt_vs_read.align_wt ) %>%
+      mutate(read_is_insert = donor_vs_read.align_read == donor_vs_read.align_donor ) %>%
+      mutate( label = case_when(
+        read_is_wt ~ 'WT',
+        read_is_insert ~ 'INSERT'
+      )) %>%
+      mutate(label=factor(label,levels=c('WT','INSERT'))) %>%
+      filter(!is.na(label)) %>%
+      mutate(umi = sub('.*_','',readname)) %>%
+      count(label, umi, name='read_count')
+}
+
+frequencies <- readr::read_csv_chunked(alignments_csv, DataFrameCallback$new(read_frequencies_chunk), col_types=csv_schema,chunk_size=params$read_chunk_size) %>%
+    group_by(label) %>%
+    summarize(read_count=sum(read_count),umi_count=length(unique(umi))) %>%
+    ungroup() %>%
+      tidyr::complete(label,fill=list(read_count=0,umi_count=0)) %>%
+      mutate(read_fraction=read_count/sum(read_count), umi_fraction=umi_count/sum(umi_count)) %>%
+      mutate(wt_to_insert_read_ratio = signif(1/read_fraction,0), wt_to_insert_umi_ratio = signif(1/umi_fraction,0)) %>%
+      mutate(id = id) %>%
+      relocate(id)
+```
+
+## Fuzzy Sequence Matching
+
+```{r fuzzy-matching}
+
+with_edit_distance <- function(data, ref_col, read_col, alignment_id){
+  insertion_col <- paste0(alignment_id,'.','n_insertion')
+  deletion_col <- paste0(alignment_id,'.','n_deletion')
+  mismatch_col <- paste0(alignment_id,'.','n_mismatches')
+  data %>%
+    mutate( "{alignment_id}.n_insertion" := nchar(gsub('[^-]','',!!enquo(ref_col))) ) %>%
+    mutate( "{alignment_id}.n_deletion" := nchar(gsub('[^-]','',!!enquo(read_col))) ) %>%
+    mutate( "{alignment_id}.n_mismatches" := stringdist::stringdist(a=!!enquo(ref_col),b=!!enquo(read_col),method='hamming'))
+}
+
+edit_distance <- function(ref,read){
+  if(!(ref == read)){
+    chars1 <- strsplit(ref,"")[[1]]
+    chars2 <- strsplit(read,"")[[1]]
+
+    n_insertion = sum(chars1 == '-')
+    n_deletion = sum(chars2 == '-')
+
+    tibble(
+      n_insertion = n_insertion,
+      n_deletion = n_deletion,
+      n_mismatches = sum(chars1 != chars2) - (n_insertion + n_deletion)
+    )
+  } else{
+    tibble(n_mismatches = 0, n_insertion = 0, n_deletion = 0)
+  }
+}
+
+
+read_chunk <- function(data, position) {
+    data %>%
+        with_edit_distance(wt_vs_read.align_wt,wt_vs_read.align_read, 'wt_vs_read') %>%
+        with_edit_distance(donor_vs_read.align_donor,donor_vs_read.align_read, 'insert_vs_read') %>%
+        mutate(label = case_when(
+            ( insert_vs_read.n_mismatches + insert_vs_read.n_insertion + insert_vs_read.n_deletion ) == 0 ~ 'INSERT',
+            ( wt_vs_read.n_mismatches + wt_vs_read.n_insertion + wt_vs_read.n_deletion ) == 0 ~ 'WT',
+
+            wt_vs_read.n_mismatches == 1 & ( (wt_vs_read.n_insertion + wt_vs_read.n_deletion) == 0 ) ~ 'WT_1mm',
+            wt_vs_read.n_deletion == 1 & ( (wt_vs_read.n_insertion + wt_vs_read.n_mismatches) == 0 ) ~ 'WT_1del',
+            wt_vs_read.n_insertion == 1 & ( (wt_vs_read.n_deletion + wt_vs_read.n_mismatches) == 0 ) ~ 'WT_1ins',
+
+            insert_vs_read.n_mismatches == 1 & ( (insert_vs_read.n_insertion + insert_vs_read.n_deletion) == 0 ) ~ 'INSERT_1mm',
+            insert_vs_read.n_deletion == 1 & ( (insert_vs_read.n_insertion + insert_vs_read.n_mismatches) == 0 ) ~ 'INSERT_1del',
+            insert_vs_read.n_insertion == 1 & ( (insert_vs_read.n_deletion + insert_vs_read.n_mismatches) == 0 ) ~ 'INSERT_1ins',
+
+            ( wt_vs_read.n_mismatches + wt_vs_read.n_insertion + wt_vs_read.n_deletion ) == 2 ~ 'WT_2edit',
+            ( insert_vs_read.n_mismatches + insert_vs_read.n_insertion + insert_vs_read.n_deletion ) == 2 ~ 'INSERT_2edit',
+            TRUE ~ 'OTHER'
+        )) %>%
+        mutate(label=factor(label,levels=c('WT','INSERT','OTHER','WT_1mm','WT_1del','WT_1ins','WT_2edit','INSERT_1mm','INSERT_1del','INSERT_1ins','INSERT_2edit'))) %>%
+        count(label,sort=T) %>%
+        tidyr::complete(label) %>%
+        replace_na(list(n=0)) %>%
+        mutate( id = id ) %>%
+        relocate( id )
+}
+
+counts_with_mismatches <- readr::read_csv_chunked(alignments_csv, DataFrameCallback$new(read_chunk), col_types=csv_schema,chunk_size=params$read_chunk_size) %>%
+    count(id,label,wt=n)
+
+
+counts_with_mismatches %>%
+    knitr::kable()
+
+readr::write_csv(counts_with_mismatches, 'mismatched_event_frequencies.csv')
+```
+
+```{r ratio-calc-func}
+calc_ratio <- function(tbl, wt_labels, insert_labels){
+  tbl %>%
+    filter(label %in% c(wt_labels,insert_labels)) %>%
+    mutate(
+      summary_label = case_when(
+        label %in% wt_labels ~ 'WT',
+        label %in% insert_labels ~ 'INSERT',
+      )
+    ) %>%
+    group_by(summary_label) %>%
+    summarize(n = sum(n))
+}
+```
+
+## Insert Frequency Calculation
+
+For the purpose of calculating the frequency of reads supporting insertions the following formula is used:
+
+$$ F_{Insert} = \frac{N_{Insert}}{N_{Insert}+N_{WildType}} $$
+
+Where $N_{Insert}$ and $N_{WildType}$ are the number of reads within the specified edit distance ( exact match, 1 mismatch, 2 mismatch, etc. ) of the given reference sequence.
+
+## Insert Frequency, Edit-Distance=1
+
+```{r one-edit}
+ratio_1edit <- calc_ratio( counts_with_mismatches, c('WT', 'WT_1mm', 'WT_1del', 'WT_1ins'), c('INSERT','INSERT_1mm','INSERT_1del','INSERT_1ins') )
+
+knitr::kable(ratio_1edit)
+
+frequency_1edit <- ratio_1edit %>%
+  mutate(frequency = n/sum(n)) %>%
+  filter(summary_label=='INSERT') %>%
+  transmute(label=summary_label,frequency)
+
+knitr::kable(frequency_1edit)
+
+```
+
+## Insert Frequency, Edit-Distance=2
+
+```{r two-edit}
+
+ratio_2edit <- calc_ratio( counts_with_mismatches, c('WT', 'WT_1mm', 'WT_1del', 'WT_1ins','WT_2edit'), c('INSERT','INSERT_1mm','INSERT_1del','INSERT_1ins','INSERT_2edit') )
+
+knitr::kable(ratio_2edit)
+
+frequency_2edit <- ratio_2edit %>%
+  mutate(frequency = n/sum(n)) %>%
+  filter(summary_label=='INSERT') %>%
+  transmute(label=summary_label,frequency)
+
+knitr::kable(frequency_2edit)
+
+```
+
+## Insert Frequency, Edit-Distance=0
+
+There is 1 inserted read per `r sprintf("%f", filter(frequencies, label=='INSERT')$wt_to_insert_read_ratio)` WT reads detected.
+
+There is 1 inserted UMI per `r sprintf("%f",filter(frequencies, label=='INSERT')$wt_to_insert_umi_ratio)` WT UMIs detected.
+
+```{r}
+knitr::kable(frequencies)
+readr::write_csv(frequencies,'event_frequencies.csv')
+```
+
+```{r, results='asis'}
+mismatch_string <- function(seq1, seq2){
+    chars1 <- strsplit(seq1,'')[[1]]
+    chars2 <- strsplit(seq2,'')[[1]]
+    mismatches <- seq_len( nchar( seq1 ) ) %>%
+        map_chr( ~ if( chars1[.x] == chars2[.x] ){ ' ' } else{ '*' } )
+    paste(mismatches,collapse='')
+}
+
+print_alignment <- function( read, seq, seq_label ){
+     cat(glue::glue('Read vs {seq_label}\n'))
+     padded_read <- sprintf('%10s','Read')
+     padded_label <- sprintf('%10s', seq_label)
+     cat(paste0("<pre style='width:3000px'>",padded_read,": ", read,'\n',
+                     sprintf('%10s%2s','',''), mismatch_string(read, seq),'\n',
+          glue::glue("{padded_label}: {seq}"),'</pre>\n'))
+
+}
+```
+
+## read_fraction
+
+In contrast to the WT:INSERT ratio described above the $read\_fraction$ referred to in this section is relative to the total number of reads sequenced.
+
+$$ \textrm{read_fraction} = \frac{N_{Read}}{N_{Total}} $$
+
+Where $N_{Read}$ is the total number of reads with a particular sequence and $N_{Total}$ is the total number of reads sequenced in a sample.
+
+```{r most-abundant, results='asis'}
+
+cat("<h2>Most abundant sequences</h2>")
+
+cat("<p>These are the top sequences by abundance (up to 50 sequences) that have a frequency > 0.1%. </p>")
+
+seq_len(min(nrow(most_abundant_sequences),50)) %>%
+    walk(~{
+            cat("<div style='border-left: 0.5rem solid; padding:12px'>")
+             cat(paste0('Read #',.x,' (read_count=',most_abundant_sequences[.x,]['read_count'],',read_fraction=',signif(most_abundant_sequences[.x,]['read_fraction'],3),')'),'<br>')
+             print_alignment( most_abundant_sequences[.x,][['wt_vs_read.align_read']], most_abundant_sequences[.x,][['wt_vs_read.align_wt']], "WT" )
+             cat("\n")
+             print_alignment( most_abundant_sequences[.x,][['donor_vs_read.align_read']], most_abundant_sequences[.x,][['donor_vs_read.align_donor']], "Inserted" )
+            cat("</div>")
+             cat("<hr>")
+    })
+```
+
+```{r most-similar, results='asis'}
+
+cat("<h2>Closest matches to inserted sequence</h2>")
+
+cat("<p>These are the top sequences (up to 50 sequences) that have the highest scoring alignment with the inserted reference sequence, irrespective of abundance. </p>")
+
+seq_len(min(nrow(most_similar_to_insert),50)) %>%
+    walk(~{
+            cat("<div style='border-left: 0.5rem solid; padding:12px'>")
+             cat(paste0('Read #',.x,' (read_count=',most_similar_to_insert[.x,]['read_count'],',read_fraction=',signif(most_similar_to_insert[.x,]['read_fraction'],3),')'),'<br>')
+             print_alignment( most_similar_to_insert[.x,][['wt_vs_read.align_read']], most_similar_to_insert[.x,][['wt_vs_read.align_wt']], "WT" )
+             cat("\n")
+             print_alignment( most_similar_to_insert[.x,][['donor_vs_read.align_read']], most_similar_to_insert[.x,][['donor_vs_read.align_donor']], "Inserted" )
+            cat("</div>")
+             cat("<hr>")
+    })
+```
