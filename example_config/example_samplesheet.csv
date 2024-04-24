@@ -1,0 +1,2 @@
+id,R1,R2,wt,insert,forward_primer,reverse_primer,umi
+sample1,/path/to/r1.fastq.gz,/path/to/r2.fastq.gz,/path/to/wt.fa,/path/to/target.fa,ATGCATGCATGC,ATGCATGC,NA
