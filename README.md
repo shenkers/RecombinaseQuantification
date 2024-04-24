@@ -19,6 +19,8 @@ This will build the docker two docker containers:
 
 If you are running this workflow on the cloud or a compute cluster you will want to distribute these images to a container registry.
 
+Once the docker images are ready, edit the `params.r_container` and `params.parasail_container` values in (nextflow.config)[nextflow.config] to point to the namespaced image IDs.
+
 ## Running the Workflow
 
 To run the workflow you must construct a samplesheet CSV describing the samples and how they should be analyzed. An example samplesheet is provided [here](example_config/example_samplesheet.csv).
