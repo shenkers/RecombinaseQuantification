@@ -1,0 +1,7 @@
+services:
+    r:
+        build: ./r
+        image: ${NAMESPACE}-r
+    parasail:
+        build: ./parasail
+        image: ${NAMESPACE}-r
