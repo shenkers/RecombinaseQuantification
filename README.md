@@ -17,7 +17,7 @@ If you are running this workflow on the cloud or a compute cluster you will want
 
 # Running the Workflow
 
-To run the workflow you must construct a samplesheet CSV describing the samples and how they should be analyzed. An example samplesheet is provided (here)[example_config/example_samplesheet.csv].
+To run the workflow you must construct a samplesheet CSV describing the samples and how they should be analyzed. An example samplesheet is provided [here](example_config/example_samplesheet.csv).
 
 The "wt" and "insert" sequences are provided as FASTA files. The FASTA sequence should contain only the portion of the amplified DNA between the forward and reverse primers.
 
